@@ -20,7 +20,7 @@ namespace fs = std::filesystem;
 // ─────────────────────────────────────────────
 //  Paths  – edit these to match your layout
 // ─────────────────────────────────────────────
-static const std::string REFERENCE_IMAGE  = "../test/input/test1.jpeg";
+static const std::string REFERENCE_IMAGE  = "../test/input/test1.png";
 static const std::string OUTPUT_IMAGE_DIR = "../test/output/frames";
 static const std::string LIBRARY_DIR      = "../test/output/library";
 static const std::string CSV_PATH         = "../test/output/results.csv";
@@ -88,7 +88,7 @@ public:
             std::cerr << "[ERROR] Reference image not found: " << REFERENCE_IMAGE << "\n";
         } else {
             cv::resize(ref, m_reference, cv::Size(), 0.5, 0.5);
-            m_orb = cv::ORB::create(1500);
+            m_orb = cv::ORB::create(3000);
             m_orb->detectAndCompute(m_reference, cv::noArray(), m_refKp, m_refDesc);
             std::cout << "[LOG] Reference image loaded. Keypoints: " << m_refKp.size() << "\n";
         }
@@ -293,14 +293,14 @@ private:
             }
 
             double confidence = 0.0;
-            if (good.size() >= 10) {
+            if (good.size() >= 4) {
                 std::vector<cv::Point2f> pts1, pts2;
                 for (auto& m : good) {
                     pts1.push_back(frameKp[m.queryIdx].pt);
                     pts2.push_back(libKp[m.trainIdx].pt);
                 }
                 cv::Mat mask;
-                cv::Mat H = cv::findHomography(pts1, pts2, cv::RANSAC, 3.0, mask);
+                cv::Mat H = cv::findHomography(pts1, pts2, cv::RANSAC, 5.0, mask);
                 if (!H.empty()) {
                     double inliers = cv::countNonZero(mask);
                     confidence = (inliers / static_cast<double>(pts1.size())) * 100.0;
@@ -312,6 +312,10 @@ private:
                       << " | Good: " << std::setw(4) << good.size()
                       << " | Confidence: " << std::fixed << std::setprecision(2)
                       << confidence << "%\n";
+
+            // Fallback: if homography gave 0, use raw good-match ratio as score
+            if (confidence == 0.0 && good.size() >= 4)
+                confidence = (good.size() / static_cast<double>(frameKp.size())) * 100.0;
 
             if (confidence > maxConfidence) {
                 maxConfidence        = confidence;
