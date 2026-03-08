@@ -20,7 +20,7 @@ namespace fs = std::filesystem;
 // ─────────────────────────────────────────────
 //  Paths  – edit these to match your layout
 // ─────────────────────────────────────────────
-static const std::string REFERENCE_IMAGE  = "../test/input/test1.png";
+static const std::string REFERENCE_IMAGE  = "../test/input/test1.jpeg";
 static const std::string OUTPUT_IMAGE_DIR = "../test/output/frames";
 static const std::string LIBRARY_DIR      = "../test/output/library";
 static const std::string CSV_PATH         = "../test/output/results.csv";
