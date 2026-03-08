@@ -13,6 +13,7 @@
 #include <ctime>
 #include <atomic>
 #include <thread>
+#include <cstdio>
 
 namespace fs = std::filesystem;
 
@@ -24,6 +25,7 @@ static const std::string OUTPUT_IMAGE_DIR = "../test/output/frames";
 static const std::string LIBRARY_DIR      = "../test/output/library";
 static const std::string CSV_PATH         = "../test/output/results.csv";
 static const int         CAPTURE_INTERVAL_SEC = 2;   // seconds between captures
+static const int         STREAM_FPS           = 10;  // rpicam-vid framerate (Pi only)
 // ─────────────────────────────────────────────
 
 struct MatchResult {
@@ -39,14 +41,10 @@ struct MatchResult {
 // ── helpers ──────────────────────────────────
 
 static std::string currentTimestamp() {
-    auto now   = std::chrono::system_clock::now();
+    auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
     localtime_r(&t, &tm);
-#endif
     std::ostringstream ss;
     ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
     return ss.str();
@@ -57,7 +55,6 @@ static void ensureDir(const std::string& path) {
 }
 
 static void writeCsvHeader(const std::string& path) {
-    // Only write header if file doesn't exist yet
     if (fs::exists(path)) return;
     std::ofstream f(path);
     f << "frame_name,timestamp,best_match_file,confidence_%,"
@@ -66,13 +63,13 @@ static void writeCsvHeader(const std::string& path) {
 
 static void appendCsvRow(const std::string& path, const MatchResult& r) {
     std::ofstream f(path, std::ios::app);
-    f << r.frameName          << ","
-      << r.timestamp          << ","
-      << r.bestMatchFile      << ","
+    f << r.frameName      << ","
+      << r.timestamp      << ","
+      << r.bestMatchFile  << ","
       << std::fixed << std::setprecision(2) << r.confidence << ","
-      << r.goodMatches        << ","
-      << r.totalKeypoints     << ","
-      << r.savedFramePath     << "\n";
+      << r.goodMatches    << ","
+      << r.totalKeypoints << ","
+      << r.savedFramePath << "\n";
 }
 
 // ─────────────────────────────────────────────
@@ -86,7 +83,6 @@ public:
         ensureDir(LIBRARY_DIR);
         writeCsvHeader(CSV_PATH);
 
-        // Pre-load reference image once
         cv::Mat ref = cv::imread(REFERENCE_IMAGE, cv::IMREAD_COLOR);
         if (ref.empty()) {
             std::cerr << "[ERROR] Reference image not found: " << REFERENCE_IMAGE << "\n";
@@ -98,65 +94,147 @@ public:
         }
     }
 
-    // ── Main blocking loop ────────────────────
     void run() {
-        cv::VideoCapture cap(0, cv::CAP_V4L2);
-        cap.set(cv::CAP_PROP_FRAME_WIDTH,  640);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-
-        if (!cap.isOpened()) {
-            std::cerr << "[ERROR] Cannot open camera.\n";
-            return;
-        }
-        std::cout << "[LOG] Camera opened. Starting capture loop...\n";
-        m_running = true;
-
-        while (m_running) {
-            cv::Mat frame = captureFrame(cap);
-            if (frame.empty()) {
-                std::cerr << "[WARN] Empty frame – retrying...\n";
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
-            }
-
-            ++m_frameIndex;
-            std::string frameName = "frame" + std::to_string(m_frameIndex);
-            std::string savePath  = OUTPUT_IMAGE_DIR + "/" + frameName + ".jpg";
-
-            // Save the raw captured frame
-            cv::imwrite(savePath, frame);
-            std::cout << "\n[LOG] Captured " << frameName << " → " << savePath << "\n";
-
-            // Run ORB matching against library
-            MatchResult result = matchFrame(frame, frameName, savePath);
-
-            // Print summary
-            std::cout << "[RESULT] Best match: " << result.bestMatchFile
-                      << "  Confidence: "        << result.confidence << "%"
-                      << "  Good matches: "      << result.goodMatches
-                      << "  Keypoints: "         << result.totalKeypoints << "\n";
-
-            // Append to CSV
-            appendCsvRow(CSV_PATH, result);
-            std::cout << "[LOG] CSV updated → " << CSV_PATH << "\n";
-
-            // Wait before next capture
-            std::this_thread::sleep_for(std::chrono::seconds(CAPTURE_INTERVAL_SEC));
-        }
+#ifdef __APPLE__
+        runMac();
+#else
+        runPi();
+#endif
     }
 
     void stop() { m_running = false; }
 
 private:
-    // ── Flush V4L2 buffer & grab fresh frame ──
-    static cv::Mat captureFrame(cv::VideoCapture& cap) {
-        for (int i = 0; i < 5; ++i) cap.grab();   // discard stale buffered frames
-        cv::Mat frame;
-        cap.retrieve(frame);
-        return frame;
+
+    // ══════════════════════════════════════════
+    //  macOS – OpenCV + AVFoundation
+    // ══════════════════════════════════════════
+#ifdef __APPLE__
+    void runMac() {
+        cv::VideoCapture cap(0, cv::CAP_AVFOUNDATION);
+        cap.set(cv::CAP_PROP_FRAME_WIDTH,  640);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+
+        if (!cap.isOpened()) {
+            std::cerr << "[ERROR] Cannot open camera (AVFoundation).\n";
+            return;
+        }
+        std::cout << "[LOG] Camera opened (AVFoundation). Starting loop...\n";
+        m_running = true;
+
+        while (m_running) {
+            for (int i = 0; i < 5; ++i) cap.grab(); // flush stale buffer
+            cv::Mat frame;
+            cap.retrieve(frame);
+
+            if (frame.empty()) {
+                std::cerr << "[WARN] Empty frame – retrying...\n";
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+            processFrame(frame);
+            std::this_thread::sleep_for(std::chrono::seconds(CAPTURE_INTERVAL_SEC));
+        }
+    }
+#endif
+
+    // ══════════════════════════════════════════
+    //  Raspberry Pi – libcamera pipe (YUV420)
+    //
+    //  Why not V4L2?
+    //  /dev/video0 = raw unicam Bayer data.
+    //  OpenCV can open it but gets empty frames.
+    //  rpicam-vid pipes fully decoded YUV420
+    //  which OpenCV converts to BGR directly.
+    // ══════════════════════════════════════════
+    void runPi() {
+        const int W = 640, H = 480;
+
+        std::string cmd =
+            "rpicam-vid"
+            " --width "     + std::to_string(W)          +
+            " --height "    + std::to_string(H)          +
+            " --codec yuv420"
+            " --framerate " + std::to_string(STREAM_FPS) +
+            " --timeout 0"   // run until killed
+            " --nopreview"
+            " -o - 2>/dev/null";
+
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            std::cerr << "[ERROR] Failed to launch rpicam-vid.\n"
+                      << "        Install with: sudo apt install rpicam-apps\n";
+            return;
+        }
+
+        std::cout << "[LOG] libcamera pipe opened ("
+                  << W << "x" << H << " @ " << STREAM_FPS << " fps).\n"
+                  << "[LOG] Processing one frame every "
+                  << CAPTURE_INTERVAL_SEC << "s. Starting loop...\n";
+        m_running = true;
+
+        // YUV420 = W * H * 3/2 bytes per frame
+        const size_t frameBytes = static_cast<size_t>(W * H * 3 / 2);
+        std::vector<uint8_t> buf(frameBytes);
+
+        // Process one frame every CAPTURE_INTERVAL_SEC seconds
+        // At STREAM_FPS=10 and INTERVAL=2 → process every 20th frame
+        const int skipTotal = STREAM_FPS * CAPTURE_INTERVAL_SEC;
+        int frameCount = 0;
+
+        while (m_running) {
+            size_t got = fread(buf.data(), 1, frameBytes, pipe);
+            if (got != frameBytes) {
+                if (feof(pipe)) {
+                    std::cerr << "[ERROR] rpicam-vid pipe closed unexpectedly.\n";
+                    break;
+                }
+                std::cerr << "[WARN] Short read (" << got << "/" << frameBytes << ") – skipping.\n";
+                continue;
+            }
+
+            ++frameCount;
+            if (frameCount % skipTotal != 0) continue; // throttle
+
+            // YUV420 → BGR
+            cv::Mat yuv(H * 3 / 2, W, CV_8UC1, buf.data());
+            cv::Mat frame;
+            cv::cvtColor(yuv, frame, cv::COLOR_YUV2BGR_I420);
+
+            if (frame.empty()) {
+                std::cerr << "[WARN] Empty frame after YUV conversion.\n";
+                continue;
+            }
+
+            processFrame(frame);
+        }
+
+        pclose(pipe);
     }
 
-    // ── ORB match one captured frame ──────────
+    // ══════════════════════════════════════════
+    //  Common: save + match + log CSV
+    // ══════════════════════════════════════════
+    void processFrame(const cv::Mat& frame) {
+        ++m_frameIndex;
+        std::string frameName = "frame" + std::to_string(m_frameIndex);
+        std::string savePath  = OUTPUT_IMAGE_DIR + "/" + frameName + ".jpg";
+
+        cv::imwrite(savePath, frame);
+        std::cout << "\n[LOG] Captured " << frameName << " → " << savePath << "\n";
+
+        MatchResult result = matchFrame(frame, frameName, savePath);
+
+        std::cout << "[RESULT] Best match : " << result.bestMatchFile  << "\n"
+                  << "         Confidence : " << result.confidence     << "%\n"
+                  << "         Good kpts  : " << result.goodMatches    << "\n"
+                  << "         Total kpts : " << result.totalKeypoints << "\n";
+
+        appendCsvRow(CSV_PATH, result);
+        std::cout << "[LOG] CSV updated → " << CSV_PATH << "\n";
+    }
+
+    // ── ORB match frame against every library image ──
     MatchResult matchFrame(const cv::Mat& rawFrame,
                            const std::string& frameName,
                            const std::string& savePath) {
@@ -174,11 +252,9 @@ private:
             return result;
         }
 
-        // Resize captured frame to match reference scale
         cv::Mat frame;
         cv::resize(rawFrame, frame, cv::Size(), 0.5, 0.5);
 
-        // Detect keypoints in the live frame
         std::vector<cv::KeyPoint> frameKp;
         cv::Mat frameDesc;
         m_orb->detectAndCompute(frame, cv::noArray(), frameKp, frameDesc);
@@ -189,7 +265,6 @@ private:
             return result;
         }
 
-        // Compare frame against every image in the library
         cv::BFMatcher matcher(cv::NORM_HAMMING);
         double maxConfidence = 0.0;
 
@@ -207,11 +282,9 @@ private:
             m_orb->detectAndCompute(libResized, cv::noArray(), libKp, libDesc);
             if (libDesc.empty()) continue;
 
-            // KNN match: frame vs library image
             std::vector<std::vector<cv::DMatch>> knnMatches;
             matcher.knnMatch(frameDesc, libDesc, knnMatches, 2);
 
-            // Lowe's ratio test
             std::vector<cv::DMatch> good;
             for (auto& m : knnMatches) {
                 if (m.size() < 2) continue;
@@ -252,12 +325,12 @@ private:
     }
 
     // ── Members ───────────────────────────────
-    cv::Mat                      m_reference;
-    cv::Ptr<cv::ORB>             m_orb;
-    std::vector<cv::KeyPoint>    m_refKp;
-    cv::Mat                      m_refDesc;
-    int                          m_frameIndex;
-    std::atomic<bool>            m_running;
+    cv::Mat                   m_reference;
+    cv::Ptr<cv::ORB>          m_orb;
+    std::vector<cv::KeyPoint> m_refKp;
+    cv::Mat                   m_refDesc;
+    int                       m_frameIndex;
+    std::atomic<bool>         m_running;
 };
 
-#endif
+#endif // MatchService_hpp
