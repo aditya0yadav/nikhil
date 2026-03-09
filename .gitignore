@@ -1,0 +1,40 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# Compiled binaries
+matcher
+TargetMatcherServer
+vision_match
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Log files
+log/
+*.log
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
